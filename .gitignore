@@ -1,0 +1,51 @@
+# Qt/qmake build outputs
+build/
+build-*/
+debug/
+release/
+Makefile
+Makefile.*
+.qmake.stash
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# Qt Creator and editor-local state
+*.pro.user
+*.pro.user.*
+.vs/
+.idea/
+
+# Runtime databases, logs, and temporary files
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+*.log
+logs/
+log/
+*.tmp
+*.part
+
+# Generated/device data must not be committed
+all_data/
+slam_data/
+evaluate_output/
+
+# Credentials and local environment files
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

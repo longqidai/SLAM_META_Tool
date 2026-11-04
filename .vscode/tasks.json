@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build SLAM META Tool (Debug)",
+            "type": "process",
+            "command": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/.vscode/build-debug.ps1"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": "$gcc",
+            "group": { "kind": "build", "isDefault": true }
+        }
+    ]
+}
+

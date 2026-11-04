@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug SLAM META Tool",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build-vscode/bin/SLAM_META_Tool.exe",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "D:/Qt/Qt5.14.2/Tools/mingw730_64/bin/gdb.exe",
+            "environment": [
+                {
+                    "name": "PATH",
+                    "value": "D:/Qt/Qt5.14.2/5.14.2/mingw73_64/bin;D:/Qt/Qt5.14.2/Tools/mingw730_64/bin;${env:PATH}"
+                }
+            ],
+            "externalConsole": false,
+            "preLaunchTask": "Build SLAM META Tool (Debug)"
+        }
+    ]
+}
