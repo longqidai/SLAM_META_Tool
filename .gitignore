@@ -1,6 +1,7 @@
 # Qt/qmake build outputs
 build/
 build-*/
+dist/
 debug/
 release/
 Makefile

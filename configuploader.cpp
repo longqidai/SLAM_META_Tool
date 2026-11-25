@@ -71,14 +71,9 @@ ConfigUploader::ConfigUploader(QObject *parent)
 {
     // 与simple_qt和设备端保持一致，使用MQTT 3.1.1，并兼容1883和26001端口。
     m_mqtt->setProtocolVersion(QMqttClient::MQTT_3_1_1);
-    // 状态机的“时钟”：上传开始后每1秒调用一次onTick()。
-    // onTick()负责轮询Wi-Fi、定时重试TCP，以及检查各阶段是否超时；
-    // TCP/MQTT连接成功和收到MQTT消息则由下面各自的异步信号立即推进，不必等下一次tick。
+    // 一个1秒定时器统一推进Wi-Fi、设备端口、MQTT、心跳和响应超时状态机。
     m_tickTimer.setInterval(1000);
     connect(&m_tickTimer, &QTimer::timeout, this, &ConfigUploader::onTick);
-
-    // ConnectingDevice阶段由attemptDeviceConnection()异步连接25001端口。
-    // 连接成功时QTcpSocket发出connected，本lambda把状态机推进到ConnectingMqtt。
     connect(m_deviceSocket, &QTcpSocket::connected, this, [this]() {
         // 25001端口连通证明热点不仅关联成功，而且DHCP、路由和设备服务已就绪。
         if (!m_running || m_phase != Phase::ConnectingDevice)
@@ -90,7 +85,6 @@ ConfigUploader::ConfigUploader(QObject *parent)
         m_deviceSocket->disconnectFromHost();
         beginMqttConnection();
     });
-    // ConnectingMqtt连接成功后进入onMqttConnected()：订阅主题并转入WaitingHeartbeat。
     connect(m_mqtt, &QMqttClient::connected,
             this, &ConfigUploader::onMqttConnected);
     connect(m_mqtt, &QMqttClient::disconnected,
@@ -128,8 +122,6 @@ ConfigUploader::ConfigUploader(QObject *parent)
                         connectCurrentMqttPort();
                 });
             });
-    // WaitingHeartbeat和WaitingResponse都靠messageReceived推进：
-    // 前者接收设备心跳并核对SN，后者接收save_config的处理结果。
     connect(m_mqtt, &QMqttClient::messageReceived, this,
             [this](const QByteArray &message, const QMqttTopicName &topic) {
                 // 心跳和save_config响应共用一个入口，再按topic和当前Phase分流。
@@ -152,11 +144,9 @@ void ConfigUploader::start(const QVector<ConfigUploadItem> &items)
     m_stopping = false;
     m_running = true;
     m_batchId = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
-    // 从这里开始，onTick()每秒检查一次当前m_phase。
     m_tickTimer.start();
     emit runningChanged(true);
     appendLog(QStringLiteral("开始配置上传批次，共 %1 台设备").arg(items.size()));
-    // 选择第一台设备，最终调用beginWifiConnection()进入ConnectingWifi。
     startNext();
 }
 
@@ -181,7 +171,6 @@ void ConfigUploader::startNext()
         finishBatch(true);
         return;
     }
-    // 上传严格逐台进行：当前设备结束后才把下标移到下一台。
     ++m_index;
     if (m_index >= m_items.size()) {
         finishBatch(false);
@@ -189,7 +178,6 @@ void ConfigUploader::startNext()
     }
     m_reqId.clear();
     m_startedAt = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
-    // 每台设备的状态机入口：Idle -> ConnectingWifi。
     beginWifiConnection();
 }
 
@@ -199,7 +187,6 @@ void ConfigUploader::beginWifiConnection()
     m_deviceSocket->abort();
     if (m_mqtt->state() != QMqttClient::Disconnected)
         m_mqtt->disconnectFromHost();
-    // onTick()进入ConnectingWifi分支后，每秒读取电脑当前连接的SSID。
     m_phase = Phase::ConnectingWifi;
     m_phaseElapsed.restart();
     m_wifiAttemptSeconds = 100;
@@ -210,7 +197,6 @@ void ConfigUploader::beginWifiConnection()
     appendLog(QStringLiteral("[%1] 正在连接设备热点，候选名称：%2")
                   .arg(m_items.at(m_index).sn,
                        candidates.join(QStringLiteral("、"))));
-    // 立即提交第一次WLAN连接请求；之后连接仍未成功时由onTick()每5秒重试。
     attemptWifiConnection();
 }
 
@@ -225,7 +211,7 @@ void ConfigUploader::attemptWifiConnection()
     m_wifiCandidateIndex = (m_wifiCandidateIndex + 1) % candidates.size();
     appendLog(QStringLiteral("[%1] 尝试连接热点 %2")
                   .arg(m_items.at(m_index).sn, ssid));
-    if (!connectOpenWifi(ssid, &error) && !error.isEmpty())
+    if (!connectOpenWifi(ssid, &error) && !error.isEmpty())//发起wifi连接
         appendLog(QStringLiteral("[%1] 发起热点连接失败：%2")
                       .arg(m_items.at(m_index).sn, error));
     m_wifiAttemptSeconds = 0;
@@ -233,14 +219,13 @@ void ConfigUploader::attemptWifiConnection()
 
 void ConfigUploader::onTick()
 {
-    // 本函数每秒执行一次。它根据m_phase只处理“当前阶段”的轮询、重试或超时，
-    // 不会从头重复整套流程。阶段成功时会修改m_phase或调用下一阶段的begin函数。
+    // 上传过程中每秒确认电脑仍连接当前设备热点；SSID改变立即失败，
+    // 防止网络切换后把配置继续发给错误设备或其他MQTT服务。
     if (!m_running || m_index < 0 || m_index >= m_items.size())
         return;
 
-    // ConnectingWifi阶段要允许电脑从原网络切换到设备热点，所以暂不执行“掉线”检查。
-    // 一旦离开ConnectingWifi，后续每个阶段都要求电脑始终连着当前设备热点；
-    // 若SSID改变或无线网断开，立即结束本台，防止把配置发给错误设备。
+    // SSID匹配只证明Wi-Fi关联成功，不能证明DHCP、路由和设备服务已经可用，
+    // 因此后面还必须经过SettlingNetwork和ConnectingDevice两步。
     if (m_phase != Phase::Idle && m_phase != Phase::ConnectingWifi) {
         const QString connected = currentConnectedSsid();
         const QString sn = m_items.at(m_index).sn;
@@ -254,12 +239,8 @@ void ConfigUploader::onTick()
         }
     }
 
-    // m_phase是单台设备上传的当前位置。一个tick只会进入下面一个case。
     switch (m_phase) {
     case Phase::ConnectingWifi: {
-        // 第1阶段：确认Windows是否已经真正连接目标热点。
-        // beginWifiConnection()/attemptWifiConnection()只负责提交WlanConnect请求；
-        // 真正连接成功必须以currentConnectedSsid()读到匹配SSID为准。
         const QString connected = currentConnectedSsid();
         const QString sn = m_items.at(m_index).sn;
         const QString expected = wifiSsidCandidates(sn).join(QStringLiteral(" / "));
@@ -267,65 +248,45 @@ void ConfigUploader::onTick()
             appendLog(QStringLiteral("[%1] 已连接热点 %2，等待网络地址就绪")
                           .arg(m_items.at(m_index).sn, connected));
             emit itemStateChanged(m_index, QStringLiteral("网络就绪中"), connected);
-            // 热点已连上，但DHCP地址和路由可能尚未就绪，进入2.5秒稳定等待阶段。
-            // restart()从零开始计算SettlingNetwork阶段的耗时。
             m_phase = Phase::SettlingNetwork;
             m_phaseElapsed.restart();
             return;
         }
-        // 从进入ConnectingWifi起超过45秒仍未匹配到目标SSID，本台上传失败。
         if (m_phaseElapsed.elapsed() >= kWifiTimeoutMs) {
             finishCurrent(false, QStringLiteral("连接热点超时：%1").arg(expected));
             return;
         }
-        // onTick每秒加1；满5次约等于5秒，再轮换候选SSID提交一次连接请求。
         if (++m_wifiAttemptSeconds >= 5)
             attemptWifiConnection();
         break;
     }
     case Phase::SettlingNetwork:
-        // 第2阶段：只等待，不主动连接。
-        // 给Windows约2.5秒完成DHCP和路由配置；到时开始探测设备固定地址的25001端口。
         if (m_phaseElapsed.elapsed() >= kNetworkSettleMs)
             beginDeviceConnection();
         break;
     case Phase::ConnectingDevice:
-        // 第3阶段：确认192.168.1.8:25001是否可达。
-        // TCP成功不是在这里判断，而是由构造函数中QTcpSocket::connected的lambda处理，
-        // 该lambda会立即调用beginMqttConnection()进入ConnectingMqtt。
         if (m_phaseElapsed.elapsed() >= kDeviceConnectTimeoutMs) {
             finishCurrent(false,
                           QStringLiteral("连接设备信息端口 192.168.1.8:25001 超时"));
         } else if (++m_deviceAttemptSeconds >= 3) {
-            // 连接尚未成功且没有超时，每约3秒重新发起一次异步TCP连接。
             attemptDeviceConnection();
         }
         break;
     case Phase::ConnectingMqtt:
-        // 第4阶段：等待QMqttClient建立连接。
-        // connectCurrentMqttPort()发起连接；errorChanged负责重试并从1883切到26001；
-        // connected信号负责调用onMqttConnected()，这里仅负责30秒总超时。
         if (m_phaseElapsed.elapsed() >= kMqttTimeoutMs) {
             finishCurrent(false,
                           QStringLiteral("连接 MQTT 192.168.1.8 失败，已尝试端口 1883、26001"));
         }
         break;
     case Phase::WaitingHeartbeat:
-        // 第5阶段：MQTT已连接且已订阅主题，等待设备心跳中的DeviceSN。
-        // 心跳到达时messageReceived -> onMqttMessage()核对SN；核对通过才上传JSON。
-        // 此分支本身只负责15秒内一直收不到有效心跳时判失败。
         if (m_phaseElapsed.elapsed() >= kHeartbeatTimeoutMs)
             finishCurrent(false, QStringLiteral("未收到设备心跳，无法核对 SN"));
         break;
     case Phase::WaitingResponse:
-        // 第6阶段：JSON已经发布，等待设备真正执行save_config后的响应。
-        // messageReceived -> onMqttMessage()只接受相同req_id的响应；error==0才算成功。
-        // MQTT publish返回消息ID不代表设备保存成功，因此这里必须继续等，最长20秒。
         if (m_phaseElapsed.elapsed() >= kResponseTimeoutMs)
             finishCurrent(false, QStringLiteral("等待 save_config 响应超时"));
         break;
     case Phase::Idle:
-        // 当前没有正在上传的设备，不进行任何轮询；开始下一台时会重新进入ConnectingWifi。
         break;
     }
 }
@@ -333,7 +294,6 @@ void ConfigUploader::onTick()
 void ConfigUploader::beginDeviceConnection()
 {
     // 热点稳定后进入设备端口探测阶段，最长等待30秒。
-    // 此函数由onTick()的SettlingNetwork分支在等待时间到达后调用。
     m_phase = Phase::ConnectingDevice;
     m_phaseElapsed.restart();
     m_deviceAttemptSeconds = 100;
@@ -341,7 +301,6 @@ void ConfigUploader::beginDeviceConnection()
                           QStringLiteral("192.168.1.8:25001"));
     appendLog(QStringLiteral("[%1] 等待 DHCP/路由就绪，连接设备信息端口 192.168.1.8:25001")
                   .arg(m_items.at(m_index).sn));
-    // 不等待下一个tick，进入阶段后立即进行第一次25001端口探测。
     attemptDeviceConnection();
 }
 
@@ -356,13 +315,11 @@ void ConfigUploader::attemptDeviceConnection()
     }
     m_deviceAttemptSeconds = 0;
     m_deviceSocket->abort();
-    // connectToHost()是异步调用：这里只是开始连接；成功结果由QTcpSocket::connected通知。
     m_deviceSocket->connectToHost(QStringLiteral("192.168.1.8"), 25001);
 }
 
 void ConfigUploader::beginMqttConnection()
 {
-    // 此函数由QTcpSocket::connected的lambda调用，说明25001探测已通过。
     // 为当前SN创建唯一MQTT客户端ID，从1883端口开始连接。
     m_phase = Phase::ConnectingMqtt;
     m_phaseElapsed.restart();
@@ -372,7 +329,6 @@ void ConfigUploader::beginMqttConnection()
     m_mqtt->setClientId(QStringLiteral("slam-meta-upload-%1-%2")
                             .arg(m_items.at(m_index).sn)
                             .arg(QDateTime::currentMSecsSinceEpoch()));
-    // 立即异步连接第一个候选MQTT端口；失败重试/换端口由errorChanged处理。
     connectCurrentMqttPort();
 }
 
@@ -387,13 +343,11 @@ void ConfigUploader::connectCurrentMqttPort()
     appendLog(QStringLiteral("[%1] 连接 MQTT 192.168.1.8:%2")
                   .arg(m_items.at(m_index).sn).arg(port));
     m_mqtt->setPort(port);
-    // connectToHost()异步返回；成功时发出QMqttClient::connected -> onMqttConnected()。
     m_mqtt->connectToHost();
 }
 
 void ConfigUploader::onMqttConnected()
 {
-    // 由QMqttClient::connected信号调用。
     // MQTT连通后先订阅设备确认响应和心跳；尚未核对SN前绝不发布配置。
     if (!m_running || m_phase != Phase::ConnectingMqtt)
         return;
@@ -405,7 +359,6 @@ void ConfigUploader::onMqttConnected()
         finishCurrent(false, QStringLiteral("订阅 MQTT 响应或心跳主题失败"));
         return;
     }
-    // 两个订阅均成功后进入WaitingHeartbeat，等messageReceived送来设备心跳。
     m_phase = Phase::WaitingHeartbeat;
     m_phaseElapsed.restart();
     emit itemStateChanged(m_index, QStringLiteral("核对设备 SN"),
@@ -426,7 +379,6 @@ void ConfigUploader::onMqttDisconnected()
 void ConfigUploader::onMqttMessage(const QByteArray &message,
                                    const QMqttTopicName &topic)
 {
-    // 由QMqttClient::messageReceived信号调用。
     // 设备消息必须是JSON对象；其他消息直接忽略，不改变当前状态机。
     if (!m_running || m_index < 0 || m_index >= m_items.size())
         return;
@@ -439,7 +391,6 @@ void ConfigUploader::onMqttMessage(const QByteArray &message,
 
     if (topic.name() == QStringLiteral("slam_app/report/heartbeat")
         && m_phase == Phase::WaitingHeartbeat) {
-        // 只有“心跳主题 + WaitingHeartbeat阶段”同时满足，消息才用于核对设备身份。
         // 心跳中的DeviceSN必须等于完整SN，或等于去掉开头SN后的设备上报格式。
         // 核对成功才能调用publishCurrentConfig()，避免连接错热点后误写配置。
         const QString actualSn = object.value(QStringLiteral("DeviceSN")).toString().trimmed();
@@ -458,14 +409,12 @@ void ConfigUploader::onMqttMessage(const QByteArray &message,
         }
         appendLog(QStringLiteral("[%1] 心跳 SN 核对通过（设备上报 %2）")
                       .arg(expectedSn, actualSn));
-        // 身份核对通过后才读取并发布该SN对应的JSON配置。
         publishCurrentConfig();
         return;
     }
 
     if (topic.name() == QStringLiteral("slam_app/response/save_config")
         && m_phase == Phase::WaitingResponse) {
-        // 只有“保存响应主题 + WaitingResponse阶段”同时满足，消息才作为上传结果处理。
         // 只接受req_id与当前请求完全一致的响应，旧响应或其他客户端响应会被忽略。
         const QString reqId = object.value(QStringLiteral("req_id")).toVariant().toString();
         if (reqId != m_reqId)
@@ -474,7 +423,6 @@ void ConfigUploader::onMqttMessage(const QByteArray &message,
         const QString description = object.value(QStringLiteral("desc")).toString();
         appendLog(QStringLiteral("[%1] 收到 save_config 响应：error=%2, desc=%3")
                       .arg(m_items.at(m_index).sn).arg(error).arg(description));
-        // 设备明确返回error==0才算上传并保存成功；MQTT发送成功本身不能代替此判断。
         if (error == 0)
             finishCurrent(true);
         else
@@ -518,8 +466,6 @@ void ConfigUploader::publishCurrentConfig()
     }
     // publish返回消息ID只代表客户端已受理发送，不能判定设备保存成功；
     // 必须等待相同req_id且error=0的save_config响应。
-    // 请求已交给MQTT客户端发送，状态转入WaitingResponse；
-    // 接下来由messageReceived匹配相同req_id，或由onTick()在20秒后判超时。
     m_phase = Phase::WaitingResponse;
     m_phaseElapsed.restart();
     emit itemStateChanged(m_index, QStringLiteral("等待设备确认"), m_reqId);
@@ -547,7 +493,6 @@ void ConfigUploader::finishCurrent(bool success, const QString &error)
     result.error = error;
     emit itemStateChanged(m_index, success ? QStringLiteral("上传成功")
                                            : QStringLiteral("上传失败"), error);
-    // 窗口收到itemFinished后把本台上传结果写入共用SQLite数据库。
     emit itemFinished(m_index, result);
     appendLog(success ? QStringLiteral("[%1] 配置上传成功").arg(item.sn)
                       : QStringLiteral("[%1] 配置上传失败：%2").arg(item.sn, error));
@@ -556,7 +501,6 @@ void ConfigUploader::finishCurrent(bool success, const QString &error)
     if (m_mqtt->state() != QMqttClient::Disconnected)
         m_mqtt->disconnectFromHost();
     // 给上一台网络连接留出短暂清理时间，然后开始下一台设备。
-    // 500毫秒后startNext()把m_index移到下一台，并再次从ConnectingWifi开始。
     QTimer::singleShot(500, this, &ConfigUploader::startNext);
 }
 

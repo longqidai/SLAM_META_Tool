@@ -833,7 +833,7 @@ void MainWindow::showConfigUploader()
     // 上传文件固定来自当前数据根目录/all_data/<SN>.json，并共用解析验证历史数据库。
     const QString allDataPath = QDir(m_dataRootEdit->text().trimmed())
                                     .filePath(QStringLiteral("all_data"));
-    m_uploadDialog = new ConfigUploadDialog(allDataPath, &m_history, this);
+    m_uploadDialog = new ConfigUploadDialog(allDataPath, &m_history, this);//构造
     m_uploadDialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(m_uploadDialog, &QObject::destroyed, this, [this] {
         m_uploadDialog = nullptr;

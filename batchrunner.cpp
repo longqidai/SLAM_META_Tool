@@ -17,8 +17,6 @@ namespace {
 const int kEnvironmentTimeoutMs = 30000;
 const int kParseTimeoutMs = 2 * 60 * 60 * 1000;
 const int kValidateTimeoutMs = 60 * 60 * 1000;
-// 即使多台设备先后到达CPU释放点，同时存活的解析进程也绝不超过三路。
-const int kMaxConcurrentParsers = 3;
 
 // 递归遍历 metrics.json，统计名称中包含 warning 的有效字段数量。
 int warningCountInValue(const QJsonValue &value)
@@ -136,7 +134,6 @@ void BatchRunner::start(const QVector<BatchDevice> &devices, const QString &batc
         QStringLiteral("-- performing '0-th' batch optimization.."));
     // 4. 所有解析/验证游标和运行标志恢复到批次初始状态。
     m_nextParseIndex = 0;
-    m_parserStartPending = false;
     m_finishedParseCount = 0;
     m_validationIndex = -1;
     m_validationPhaseStarted = false;
@@ -165,7 +162,7 @@ void BatchRunner::start(const QVector<BatchDevice> &devices, const QString &batc
         .arg(batchId).arg(devices.size()).arg(modeText));
     if (m_mode != BatchMode::ValidateOnly) {
         appendLog(-1, QStringLiteral(
-            "解析阶段先等待“%1”，再识别到该轮优化的迭代号1数据行后放行下一台；并行解析最多三台。单台解析完整成功后即可开始验证，后续设备解析可与当前验证并行。")
+            "解析阶段先等待“%1”，再识别到该轮优化的迭代号1数据行后放行下一台；不再限制同时存活的解析任务数量。单台解析完整成功后即可开始验证，后续设备解析可与当前验证并行。")
                       .arg(m_releaseMarker));
     }
     // 7. 从 DockerVersion 开始环境检查；检查完成前不会解析 META。
@@ -228,7 +225,7 @@ void BatchRunner::runControl(ControlStep step, const QString &program,
     appendLog(step == ControlStep::Validating ? m_validationIndex : -1,
               QStringLiteral("执行：%1").arg(displayCommand(program, arguments)), true);
     // 4. 异步启动命令并启动对应超时定时器，不阻塞 Qt 主界面。
-    m_controlProcess.start(program, arguments);//Docker产生输出，触发BatchRunner::controlFinished
+    m_controlProcess.start(program, arguments);//Docker产生输出，触发QProcess::finished
     m_controlTimer.start(timeoutMs);
 }
 
@@ -436,42 +433,24 @@ void BatchRunner::controlTimedOut()
 }
 
 // 解析流水线推进函数。m_nextParseIndex 指向下一台尚未启动的设备；
-// 它可由环境检查完成、CPU释放标记或并行槽位空出三个时机触发。
+// 它由环境检查完成或上一台设备的CPU释放标记触发。
 void BatchRunner::startNextParser()
 {
     // 1. 已停止/正在停止时不再创建新的解析进程。
     if (!m_running || m_stopping)
         return;
 
-    // 2. 统计Starting/Running状态，硬性限制最多只有三个解析进程并行。
-    int activeParserCount = 0;
-    for (const ParseContext *context : m_parseContexts) {
-        if (context->process
-            && context->process->state() != QProcess::NotRunning) {
-            ++activeParserCount;
-        }
-    }
-    if (activeParserCount >= kMaxConcurrentParsers) {
-        m_parserStartPending = true;
-        appendLog(-1, QStringLiteral(
-            "已有%1台设备正在并行解析，下一台等待解析槽位释放。")
-                      .arg(kMaxConcurrentParsers));
-        return;
-    }
-
-    // 3. 所有设备都已经“启动过解析”时不再越界，转而唤醒验证和结束判断。
+    // 2. 所有设备都已经“启动过解析”时不再越界，转而唤醒验证和结束判断。
     if (m_nextParseIndex >= m_devices.size()) {
-        m_parserStartPending = false;
         maybeStartValidationPhase();
         return;
     }
 
-    // 4. 消耗一次待启动请求并增加游标，确保释放信号不会重复启动同一台。
-    m_parserStartPending = false;
+    // 3. 增加游标，确保释放信号不会重复启动同一台。
     const int index = m_nextParseIndex++;
     // META 已在主界面自动扫描时确定；Docker 和 /data 就绪后直接解析。
     // 文件在此后若被删除或损坏，由解析程序的退出码和输出完整性检查处理。
-    // 5. 进入当前设备的实际解析启动函数。
+    // 4. 进入当前设备的实际解析启动函数。
     launchParser(index);
 }
 
@@ -640,9 +619,8 @@ void BatchRunner::parserReleaseSeen(int index, bool fallback)
     ParseContext *context = m_parseContexts.at(index);
     if (context->releaseSeen)
         return;
-    // 2. 区分算法主动标记和进程退出后的保底放行，并登记一次调度请求。
+    // 2. 区分算法主动标记和进程退出后的保底放行。
     context->releaseSeen = true;
-    m_parserStartPending = true;
     appendLog(index, fallback
         ? QStringLiteral("未识别到0-th批优化迭代号1；解析进程已结束，安全启动下一台解析。")
         : QStringLiteral("收到 CPU 高占用阶段结束标志；申请启动下一台解析，当前解析仍未完成。"));
@@ -691,10 +669,6 @@ void BatchRunner::parserFinished(int index, int exitCode, QProcess::ExitStatus e
         completeParse(index, exitCode);
     }
 
-    // 6. 如果某台此前已到释放点、但因三路并行上限未能启动下一台，
-    // 当前进程退出后槽位已经空出，在这里补启且仍经过三路上限检查。
-    if (m_parserStartPending)
-        startNextParser();
 }
 
 // 处理 QProcess 本身无法启动（例如找不到 docker.exe）。普通算法非零退出

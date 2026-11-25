@@ -119,8 +119,6 @@ private:
     bool m_running = false;
     bool m_stopping = false;
     int m_nextParseIndex = 0;
-    // 达到三路并行上限时保留一次启动请求；任一解析退出后再补启下一台。
-    bool m_parserStartPending = false;
     // 已完整退出并判定成功/失败的解析数量，用于确认整批能否最终结束。
     int m_finishedParseCount = 0;
     // 验证严格按该索引顺序单路推进；遇到尚未解析完的设备会等待。
